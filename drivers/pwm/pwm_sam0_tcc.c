@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2020 Google LLC.
  * Copyright (c) 2024 Gerson Fernando Budke <nandojve@gmail.com>
+ * Copyright (c) 2025 GP Orcullo
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -12,17 +13,17 @@
 
 #define DT_DRV_COMPAT atmel_sam0_tcc_pwm
 
-#include <zephyr/device.h>
-#include <errno.h>
+#include <zephyr/kernel.h>
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/drivers/pinctrl.h>
-#include <soc.h>
+
+#include "pwm_sam0_tcc.h"
 
 /* clang-format off */
 
 /* Static configuration */
 struct pwm_sam0_config {
-	Tcc *regs;
+	uintptr_t regs;
 	const struct pinctrl_dev_config *pcfg;
 	uint8_t channels;
 	uint8_t counter_size;
@@ -35,9 +36,9 @@ struct pwm_sam0_config {
 };
 
 /* Wait for the peripheral to finish all commands */
-static void wait_synchronization(Tcc *regs)
+static void wait_synchronization(uintptr_t regs)
 {
-	while (regs->SYNCBUSY.reg != 0) {
+	while (sys_read32(regs + SYNCBUSY_OFFSET) != 0) {
 	}
 }
 
@@ -59,11 +60,16 @@ static int pwm_sam0_set_cycles(const struct device *dev, uint32_t channel,
 			       pwm_flags_t flags)
 {
 	const struct pwm_sam0_config *const cfg = dev->config;
-	Tcc *regs = cfg->regs;
+	uintptr_t regs = cfg->regs;
 	uint32_t top = 1 << cfg->counter_size;
-	uint32_t invert_mask = 1 << channel;
 	bool invert = ((flags & PWM_POLARITY_INVERTED) != 0);
-	bool inverted = ((regs->DRVCTRL.vec.INVEN & invert_mask) != 0);
+	uint32_t invert_mask;
+	bool inverted;
+
+	/* Invert all outputs belonging to the same channel */
+	invert_mask = FIELD_PREP(DRVCTRL_INVEN_MASK, (BIT(cfg->channels) | 1) << channel);
+
+	inverted = (sys_read32(regs + DRVCTRL_OFFSET) & invert_mask) != 0;
 
 	if (channel >= cfg->channels) {
 		return -EINVAL;
@@ -76,22 +82,20 @@ static int pwm_sam0_set_cycles(const struct device *dev, uint32_t channel,
 	 * Update the buffered width and period.  These will be automatically
 	 * loaded on the next cycle.
 	 */
-#ifdef TCC_PERBUF_PERBUF
-	/* SAME51 naming */
-	regs->CCBUF[channel].reg = TCC_CCBUF_CCBUF(pulse_cycles);
-	regs->PERBUF.reg = TCC_PERBUF_PERBUF(period_cycles);
-#else
-	/* SAMD21 naming */
-	regs->CCB[channel].reg = TCC_CCB_CCB(pulse_cycles);
-	regs->PERB.reg = TCC_PERB_PERB(period_cycles);
-#endif
+	sys_write32(CCBUF_CCBUF(pulse_cycles), regs + CCBUF_OFFSET + (4 * channel));
+	sys_write32(PERBUF_PERBUF(period_cycles), regs + PERBUF_OFFSET);
 
 	if (invert != inverted) {
-		regs->CTRLA.bit.ENABLE = 0;
+		/* Wait until previous update is done */
 		wait_synchronization(regs);
 
-		regs->DRVCTRL.vec.INVEN ^= invert_mask;
-		regs->CTRLA.bit.ENABLE = 1;
+		sys_clear_bit(regs + CTRLA_OFFSET, CTRLA_ENABLE_BIT);
+		wait_synchronization(regs);
+
+		invert_mask ^= sys_read32(regs + DRVCTRL_OFFSET);
+
+		sys_write32(invert_mask, regs + DRVCTRL_OFFSET);
+		sys_set_bit(regs + CTRLA_OFFSET, CTRLA_ENABLE_BIT);
 		wait_synchronization(regs);
 	}
 
@@ -101,18 +105,18 @@ static int pwm_sam0_set_cycles(const struct device *dev, uint32_t channel,
 static int pwm_sam0_init(const struct device *dev)
 {
 	const struct pwm_sam0_config *const cfg = dev->config;
-	Tcc *regs = cfg->regs;
+	const uintptr_t gclk = DT_REG_ADDR(DT_INST(0, atmel_sam0_gclk));
+	uintptr_t regs = cfg->regs;
 	int retval;
 
 	*cfg->mclk |= cfg->mclk_mask;
 
-#ifdef MCLK
-	GCLK->PCHCTRL[cfg->gclk_id].reg = GCLK_PCHCTRL_CHEN
-					| GCLK_PCHCTRL_GEN(cfg->gclk_gen);
+#if !defined(CONFIG_SOC_SERIES_SAMD21) && !defined(CONFIG_SOC_SERIES_SAMR21)
+	sys_write32(PCHCTRL_CHEN | PCHCTRL_GEN(cfg->gclk_gen),
+		    gclk + PCHCTRL_OFFSET + (4 * cfg->gclk_id));
 #else
-	GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN
-			  | GCLK_CLKCTRL_GEN(cfg->gclk_gen)
-			  | GCLK_CLKCTRL_ID(cfg->gclk_id);
+	sys_write16(CLKCTRL_CLKEN | CLKCTRL_GEN(cfg->gclk_gen) | CLKCTRL_ID(cfg->gclk_id),
+		    gclk + CLKCTRL_OFFSET);
 #endif
 
 	retval = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_DEFAULT);
@@ -120,14 +124,16 @@ static int pwm_sam0_init(const struct device *dev)
 		return retval;
 	}
 
-	regs->CTRLA.bit.SWRST = 1;
+	sys_set_bit(regs + CTRLA_OFFSET, CTRLA_SWRST_BIT);
 	wait_synchronization(regs);
 
-	regs->CTRLA.reg = cfg->prescaler;
-	regs->WAVE.reg = TCC_WAVE_WAVEGEN_NPWM;
-	regs->PER.reg = TCC_PER_PER(1);
+	sys_write32(cfg->prescaler, regs + CTRLA_OFFSET);
+	uint32_t tmp = sys_read32(regs + WAVE_OFFSET) & ~WAVE_WAVEGEN_MASK;
 
-	regs->CTRLA.bit.ENABLE = 1;
+	sys_write32(tmp | WAVE_WAVEGEN_NPWM, regs + WAVE_OFFSET);
+	sys_write32(PER_PER(1), regs + PER_OFFSET);
+
+	sys_set_bit(regs + CTRLA_OFFSET, CTRLA_ENABLE_BIT);
 	wait_synchronization(regs);
 
 	return 0;
@@ -138,21 +144,39 @@ static DEVICE_API(pwm, pwm_sam0_driver_api) = {
 	.get_cycles_per_sec = pwm_sam0_get_cycles_per_sec,
 };
 
-#define ASSIGNED_CLOCKS_CELL_BY_NAME						\
-	ATMEL_SAM0_DT_INST_ASSIGNED_CLOCKS_CELL_BY_NAME
+#ifndef ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET
+#define ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET(n, cell)			\
+	(volatile uint32_t *)							\
+	(DT_REG_ADDR(DT_INST_PHANDLE_BY_NAME(n, clocks, cell)) +		\
+	 DT_INST_CLOCKS_CELL_BY_NAME(n, cell, offset))
+#endif
+
+#ifndef ATMEL_SAM0_DT_INST_MCLK_PM_REG_ADDR_OFFSET
+#define ATMEL_SAM0_DT_INST_MCLK_PM_REG_ADDR_OFFSET(n)				\
+	COND_CODE_1(DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(mclk)),		\
+		(ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET(n, mclk)),		\
+		(ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET(n, pm)))
+#endif
+
+#ifndef ATMEL_SAM0_DT_INST_MCLK_PM_PERIPH_MASK
+#define ATMEL_SAM0_DT_INST_MCLK_PM_PERIPH_MASK(n, cell)				\
+	COND_CODE_1(DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(mclk)),		\
+		(BIT(DT_INST_CLOCKS_CELL_BY_NAME(n, mclk, cell))),		\
+		(BIT(DT_INST_CLOCKS_CELL_BY_NAME(n, pm, cell))))
+#endif
 
 #define PWM_SAM0_INIT(inst)							\
 	PINCTRL_DT_INST_DEFINE(inst);						\
 	static const struct pwm_sam0_config pwm_sam0_config_##inst = {		\
-		.regs = (Tcc *)DT_INST_REG_ADDR(inst),				\
+		.regs = DT_INST_REG_ADDR(inst),					\
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),			\
 		.channels = DT_INST_PROP(inst, channels),			\
 		.counter_size = DT_INST_PROP(inst, counter_size),		\
-		.prescaler = UTIL_CAT(TCC_CTRLA_PRESCALER_DIV,			\
+		.prescaler = UTIL_CAT(CTRLA_PRESCALER_DIV,			\
 				      DT_INST_PROP(inst, prescaler)),		\
-		.freq = SOC_ATMEL_SAM0_GCLK0_FREQ_HZ /				\
+		.freq = CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC /			\
 			DT_INST_PROP(inst, prescaler),				\
-		.gclk_gen = ASSIGNED_CLOCKS_CELL_BY_NAME(inst, gclk, gen),	\
+		.gclk_gen = DT_PHA_BY_NAME(DT_DRV_INST(inst), atmel_assigned_clocks, gclk, gen), \
 		.gclk_id = DT_INST_CLOCKS_CELL_BY_NAME(inst, gclk, id),		\
 		.mclk = ATMEL_SAM0_DT_INST_MCLK_PM_REG_ADDR_OFFSET(inst),	\
 		.mclk_mask = ATMEL_SAM0_DT_INST_MCLK_PM_PERIPH_MASK(inst, bit),	\
