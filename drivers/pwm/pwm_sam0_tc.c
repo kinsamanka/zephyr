@@ -3,6 +3,7 @@
  *
  * Heavily based on pwm_sam0_tcc.c, which is:
  * Copyright (c) 2020 Google LLC.
+ * Copyright (c) 2025 GP Orcullo
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -22,17 +23,16 @@
 #define DT_DRV_COMPAT atmel_sam0_tc_pwm
 
 #include <zephyr/kernel.h>
-#include <zephyr/device.h>
-#include <errno.h>
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/drivers/pinctrl.h>
-#include <soc.h>
+
+#include "pwm_sam0_tc.h"
 
 /* clang-format off */
 
 /* Static configuration */
 struct pwm_sam0_config {
-	Tc *regs;
+	uintptr_t regs;
 	const struct pinctrl_dev_config *pcfg;
 	uint8_t channels;
 	uint8_t counter_size;
@@ -47,15 +47,18 @@ struct pwm_sam0_config {
 #define COUNTER_8BITS 8U
 
 /* Wait for the peripheral to finish all commands */
-static void wait_synchronization(Tc *regs, uint8_t counter_size)
+static void wait_synchronization(uintptr_t regs)
 {
-	if (COUNTER_8BITS == counter_size) {
-		while (regs->COUNT8.SYNCBUSY.reg != 0) {
-		}
-	} else {
-		while (regs->COUNT16.SYNCBUSY.reg != 0) {
-		}
+#if defined(CONFIG_SOC_SERIES_SAMD20) || defined(CONFIG_SOC_SERIES_SAMD21) ||                      \
+	defined(CONFIG_SOC_SERIES_SAMR21)
+	/* SYNCBUSY is a bit */
+	while (sys_read8(regs + STATUS_OFFSET) & STATUS_SYNCBUSY) {
 	}
+#else
+	/* SYNCBUSY is a register */
+	while (sys_read32(regs + SYNCBUSY_OFFSET) != 0) {
+	}
+#endif
 }
 
 static int pwm_sam0_get_cycles_per_sec(const struct device *dev,
@@ -76,12 +79,12 @@ static int pwm_sam0_set_cycles(const struct device *dev, uint32_t channel, uint3
 			       uint32_t pulse_cycles, pwm_flags_t flags)
 {
 	const struct pwm_sam0_config *const cfg = dev->config;
-	Tc *regs = cfg->regs;
+	uintptr_t regs = cfg->regs;
 	uint8_t counter_size = cfg->counter_size;
 	uint32_t top = 1 << counter_size;
 	uint32_t invert_mask = 1 << channel;
 	bool invert = ((flags & PWM_POLARITY_INVERTED) != 0);
-	bool inverted;
+	bool inverted = (sys_read8(regs + DRVCTRL_OFFSET) & invert_mask) != 0;
 
 	if (channel >= cfg->channels) {
 		return -EINVAL;
@@ -95,33 +98,31 @@ static int pwm_sam0_set_cycles(const struct device *dev, uint32_t channel, uint3
 	 * loaded on the next cycle.
 	 */
 	if (COUNTER_8BITS == counter_size) {
-		inverted = ((regs->COUNT8.DRVCTRL.vec.INVEN & invert_mask) != 0);
-		regs->COUNT8.CCBUF[channel].reg = TC_COUNT8_CCBUF_CCBUF(pulse_cycles);
-		regs->COUNT8.PERBUF.reg = TC_COUNT8_PERBUF_PERBUF(period_cycles);
-		wait_synchronization(regs, counter_size);
-
-		if (invert != inverted) {
-			regs->COUNT8.CTRLA.bit.ENABLE = 0;
-			wait_synchronization(regs, counter_size);
-
-			regs->COUNT8.DRVCTRL.vec.INVEN ^= invert_mask;
-			regs->COUNT8.CTRLA.bit.ENABLE = 1;
-			wait_synchronization(regs, counter_size);
-		}
+		sys_write8(pulse_cycles, regs + CC_OFFSET + channel);
+		sys_write8(period_cycles, regs + PER_OFFSET);
 	} else {
-		inverted = ((regs->COUNT16.DRVCTRL.vec.INVEN & invert_mask) != 0);
-		regs->COUNT16.CCBUF[0].reg = TC_COUNT16_CCBUF_CCBUF(period_cycles);
-		regs->COUNT16.CCBUF[1].reg = TC_COUNT16_CCBUF_CCBUF(pulse_cycles);
-		wait_synchronization(regs, counter_size);
+		sys_write16(period_cycles, regs + CC_OFFSET);
+		sys_write16(pulse_cycles, regs + CC_OFFSET + 2);
+	}
 
-		if (invert != inverted) {
-			regs->COUNT16.CTRLA.bit.ENABLE = 0;
-			wait_synchronization(regs, counter_size);
+	if (invert != inverted) {
+		/* Wait until previous update is done */
+		wait_synchronization(regs);
 
-			regs->COUNT16.DRVCTRL.vec.INVEN ^= invert_mask;
-			regs->COUNT16.CTRLA.bit.ENABLE = 1;
-			wait_synchronization(regs, counter_size);
-		}
+		/* On some devices, CTRLA register is 16bits */
+		uint16_t ctrla = sys_read16(regs + CTRLA_OFFSET);
+
+		WRITE_BIT(ctrla, CTRLA_ENABLE_BIT, 0);
+		sys_write16(ctrla, regs + CTRLA_OFFSET);
+		wait_synchronization(regs);
+
+		invert_mask ^= sys_read8(regs + DRVCTRL_OFFSET);
+
+		sys_write8(invert_mask, regs + DRVCTRL_OFFSET);
+
+		WRITE_BIT(ctrla, CTRLA_ENABLE_BIT, 1);
+		sys_write16(ctrla, regs + CTRLA_OFFSET);
+		wait_synchronization(regs);
 	}
 
 	return 0;
@@ -130,19 +131,20 @@ static int pwm_sam0_set_cycles(const struct device *dev, uint32_t channel, uint3
 static int pwm_sam0_init(const struct device *dev)
 {
 	const struct pwm_sam0_config *const cfg = dev->config;
+	const uintptr_t gclk = DT_REG_ADDR(DT_INST(0, atmel_sam0_gclk));
 	uint8_t counter_size = cfg->counter_size;
-	Tc *regs = cfg->regs;
+	uintptr_t regs = cfg->regs;
 	int retval;
 
 	*cfg->mclk |= cfg->mclk_mask;
 
-#ifdef MCLK
-	GCLK->PCHCTRL[cfg->gclk_id].reg = GCLK_PCHCTRL_CHEN
-					| GCLK_PCHCTRL_GEN(cfg->gclk_gen);
+#if !defined(CONFIG_SOC_SERIES_SAMD20) && !defined(CONFIG_SOC_SERIES_SAMD21) &&                    \
+	!defined(CONFIG_SOC_SERIES_SAMR21)
+	sys_write32(PCHCTRL_CHEN | PCHCTRL_GEN(cfg->gclk_gen),
+		    gclk + PCHCTRL_OFFSET + (4 * cfg->gclk_id));
 #else
-	GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN
-			  | GCLK_CLKCTRL_GEN(cfg->gclk_gen)
-			  | GCLK_CLKCTRL_ID(cfg->gclk_id);
+	sys_write16(CLKCTRL_CLKEN | CLKCTRL_GEN(cfg->gclk_gen) | CLKCTRL_ID(cfg->gclk_id),
+		    gclk + CLKCTRL_OFFSET);
 #endif
 
 	retval = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_DEFAULT);
@@ -150,29 +152,35 @@ static int pwm_sam0_init(const struct device *dev)
 		return retval;
 	}
 
+	/* On some devices, CTRLA register is 16bits */
+	uint16_t ctrla = sys_read16(regs + CTRLA_OFFSET);
+
+	WRITE_BIT(ctrla, CTRLA_SWRST_BIT, 1);
+	sys_write16(ctrla, regs + CTRLA_OFFSET);
+	wait_synchronization(regs);
+
+	uint8_t wave = sys_read8(regs + WAVE_OFFSET);
+
 	if (COUNTER_8BITS == counter_size) {
-		regs->COUNT8.CTRLA.bit.SWRST = 1;
-		wait_synchronization(regs, counter_size);
+		sys_write16(cfg->prescaler | CTRLA_MODE_COUNT8 | CTRLA_PRESCSYNC_PRESC,
+			    regs + CTRLA_OFFSET);
 
-		regs->COUNT8.CTRLA.reg = cfg->prescaler | TC_CTRLA_MODE_COUNT8 |
-						TC_CTRLA_PRESCSYNC_PRESC;
-		regs->COUNT8.WAVE.reg = TC_WAVE_WAVEGEN_NPWM;
-		regs->COUNT8.PER.reg = TC_COUNT8_PER_PER(1);
-
-		regs->COUNT8.CTRLA.bit.ENABLE = 1;
-		wait_synchronization(regs, counter_size);
+		wave &= ~WAVE_WAVEGEN_MASK;
+		sys_write8(wave | WAVE_WAVEGEN_NPWM, regs + WAVE_OFFSET);
+		sys_write8(1, regs + PER_OFFSET);
 	} else {
-		regs->COUNT16.CTRLA.bit.SWRST = 1;
-		wait_synchronization(regs, counter_size);
+		sys_write16(cfg->prescaler | CTRLA_MODE_COUNT16 | CTRLA_PRESCSYNC_PRESC,
+			    regs + CTRLA_OFFSET);
 
-		regs->COUNT16.CTRLA.reg = cfg->prescaler | TC_CTRLA_MODE_COUNT16 |
-						TC_CTRLA_PRESCSYNC_PRESC;
-		regs->COUNT16.WAVE.reg = TC_WAVE_WAVEGEN_MPWM;
-		regs->COUNT16.CC[0].reg = TC_COUNT16_CC_CC(1);
-
-		regs->COUNT16.CTRLA.bit.ENABLE = 1;
-		wait_synchronization(regs, cfg->counter_size);
+		wave &= ~WAVE_WAVEGEN_MASK;
+		sys_write8(wave | WAVE_WAVEGEN_MPWM, regs + WAVE_OFFSET);
+		sys_write16(1, regs + CC_OFFSET);
 	}
+
+	ctrla = sys_read16(regs + CTRLA_OFFSET);
+	WRITE_BIT(ctrla, CTRLA_ENABLE_BIT, 1);
+	sys_write16(ctrla, regs + CTRLA_OFFSET);
+	wait_synchronization(regs);
 
 	return 0;
 }
@@ -182,22 +190,40 @@ static DEVICE_API(pwm, pwm_sam0_driver_api) = {
 	.get_cycles_per_sec = pwm_sam0_get_cycles_per_sec,
 };
 
-#define ASSIGNED_CLOCKS_CELL_BY_NAME						\
-	ATMEL_SAM0_DT_INST_ASSIGNED_CLOCKS_CELL_BY_NAME
+#ifndef ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET
+#define ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET(n, cell)			\
+	(volatile uint32_t *)							\
+	(DT_REG_ADDR(DT_INST_PHANDLE_BY_NAME(n, clocks, cell)) +		\
+	 DT_INST_CLOCKS_CELL_BY_NAME(n, cell, offset))
+#endif
+
+#ifndef ATMEL_SAM0_DT_INST_MCLK_PM_REG_ADDR_OFFSET
+#define ATMEL_SAM0_DT_INST_MCLK_PM_REG_ADDR_OFFSET(n)				\
+	COND_CODE_1(DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(mclk)),		\
+		(ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET(n, mclk)),		\
+		(ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET(n, pm)))
+#endif
+
+#ifndef ATMEL_SAM0_DT_INST_MCLK_PM_PERIPH_MASK
+#define ATMEL_SAM0_DT_INST_MCLK_PM_PERIPH_MASK(n, cell)				\
+	COND_CODE_1(DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(mclk)),		\
+		(BIT(DT_INST_CLOCKS_CELL_BY_NAME(n, mclk, cell))),		\
+		(BIT(DT_INST_CLOCKS_CELL_BY_NAME(n, pm, cell))))
+#endif
 
 #define PWM_SAM0_INIT(inst)							\
 	PINCTRL_DT_INST_DEFINE(inst);						\
 										\
 	static const struct pwm_sam0_config pwm_sam0_config_##inst = {		\
-		.regs = (Tc *)DT_INST_REG_ADDR(inst),				\
+		.regs = DT_INST_REG_ADDR(inst),					\
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),			\
 		.channels = DT_INST_PROP(inst, channels),			\
 		.counter_size = DT_INST_PROP(inst, counter_size),		\
-		.prescaler = UTIL_CAT(TC_CTRLA_PRESCALER_DIV,			\
+		.prescaler = UTIL_CAT(CTRLA_PRESCALER_DIV,			\
 				      DT_INST_PROP(inst, prescaler)),		\
-		.freq = SOC_ATMEL_SAM0_GCLK0_FREQ_HZ /				\
-			DT_INST_PROP(inst, prescaler),		\
-		.gclk_gen = ASSIGNED_CLOCKS_CELL_BY_NAME(inst, gclk, gen),	\
+		.freq = CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC /			\
+			DT_INST_PROP(inst, prescaler),				\
+		.gclk_gen = DT_PHA_BY_NAME(DT_DRV_INST(inst), atmel_assigned_clocks, gclk, gen), \
 		.gclk_id = DT_INST_CLOCKS_CELL_BY_NAME(inst, gclk, id),		\
 		.mclk = ATMEL_SAM0_DT_INST_MCLK_PM_REG_ADDR_OFFSET(inst),	\
 		.mclk_mask = ATMEL_SAM0_DT_INST_MCLK_PM_PERIPH_MASK(inst, bit),	\
