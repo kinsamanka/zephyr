@@ -11,6 +11,7 @@
 #include <zephyr/dt-bindings/gpio/gpio.h>
 #include <zephyr/dt-bindings/i2c/i2c.h>
 #include <zephyr/dt-bindings/pinctrl/atmel_sam_pinctrl.h>
+#include <zephyr/dt-bindings/pwm/pwm.h>
 
 #define PA0D_SERCOM1_PAD0 SAM_PINMUX(a, 0, d, periph)
 #define PA1D_SERCOM1_PAD1 SAM_PINMUX(a, 1, d, periph)
@@ -20,6 +21,9 @@
 #define PA17D_SERCOM3_PAD1 SAM_PINMUX(a, 17, d, periph)
 #define PA18D_SERCOM3_PAD2 SAM_PINMUX(a, 18, d, periph)
 #define PA19D_SERCOM3_PAD3 SAM_PINMUX(a, 19, d, periph)
+
+#define PA23F_TCC0_WO5 SAM_PINMUX(a, 23, f, periph)
+#define PA23E_TC0_WO1 SAM_PINMUX(a, 23, e, periph)
 
 / {
 	model = "PIC32CM MC00 Curiosity Nano";
@@ -34,9 +38,11 @@
 
 	aliases {
 		led0 = &led0;
+		pwm-led0 = &pwm_led0;
 	};
 
 	leds {
+		status = "okay";
 		compatible = "gpio-leds";
 		led0: led_0 {
 			gpios = <&porta 23 GPIO_ACTIVE_LOW>;
@@ -44,6 +50,18 @@
 		};
 	};
 
+	pwm_leds {
+		status = "disabled";
+		compatible = "pwm-leds";
+
+		pwm_led0: pwm_led0 {
+			pwms = <&tcc0 1 PWM_MSEC(10)>;
+		};
+
+		pwm_led1: pwm_led1 {
+			pwms = <&tc0 1 PWM_MSEC(10)>;
+		};
+	};
 };
 
 &cpu0 {
@@ -71,6 +89,18 @@
 				 <PA17D_SERCOM3_PAD1>,
 				 <PA18D_SERCOM3_PAD2>,
 				 <PA19D_SERCOM3_PAD3>;
+		};
+	};
+
+	tcc0_pwm: tcc0_pwm {
+		group1 {
+			pinmux = <PA23F_TCC0_WO5>;
+		};
+	};
+
+	tc0_pwm: tc0_pwm {
+		group1 {
+			pinmux = <PA23E_TC0_WO1>;
 		};
 	};
 };
@@ -106,5 +136,29 @@
 	#size-cells = <0>;
 
 	pinctrl-0 = <&sercom3_spi>;
+	pinctrl-names = "default";
+};
+
+&tcc0 {
+	status = "disabled";
+	compatible = "atmel,sam0-tcc-pwm";
+	channels = <4>;
+	counter-size = <24>;
+	prescaler = <1024>;
+	#pwm-cells = <2>;
+
+	pinctrl-0 = <&tcc0_pwm>;
+	pinctrl-names = "default";
+};
+
+&tc0 {
+	status = "disabled";
+	compatible = "atmel,sam0-tc-pwm";
+	channels = <2>;
+	counter-size = <16>;
+	prescaler = <1024>;
+	#pwm-cells = <2>;
+
+	pinctrl-0 = <&tc0_pwm>;
 	pinctrl-names = "default";
 };

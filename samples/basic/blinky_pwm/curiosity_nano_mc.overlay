@@ -1,0 +1,18 @@
+/{
+	aliases {
+		led0 = &led0;
+		pwm-led0 = &pwm_led1;
+	};
+
+	leds {
+		status = "disabled";
+	};
+
+	pwm_leds {
+		status = "okay";
+	};
+};
+
+&tc0 {
+	status = "okay";
+};

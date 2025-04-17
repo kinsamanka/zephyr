@@ -1,0 +1,13 @@
+/{
+	leds {
+		status = "disabled";
+	};
+
+	pwm_leds {
+		status = "okay";
+	};
+};
+
+&tcc0 {
+	status = "okay";
+};
