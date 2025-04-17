@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2019 Derek Hageman <hageman@inthat.cloud>
  * Copyright (c) 2024 Gerson Fernando Budke <nandojve@gmail.com>
+ * Copyright (c) 2025 GP Orcullo
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -9,12 +10,12 @@
 
 #include <zephyr/drivers/counter.h>
 #include <zephyr/drivers/pinctrl.h>
-#include <zephyr/device.h>
 #include <zephyr/irq.h>
-#include <soc.h>
-
 #include <zephyr/logging/log.h>
+
 LOG_MODULE_REGISTER(counter_sam0_tc32, CONFIG_COUNTER_LOG_LEVEL);
+
+#include "counter_sam0_tc32.h"
 
 /* clang-format off */
 
@@ -32,7 +33,7 @@ struct counter_sam0_tc32_data {
 
 struct counter_sam0_tc32_config {
 	struct counter_config_info info;
-	TcCount32 *regs;
+	uintptr_t regs;
 	const struct pinctrl_dev_config *pcfg;
 	volatile uint32_t *mclk;
 	uint32_t mclk_mask;
@@ -42,45 +43,44 @@ struct counter_sam0_tc32_config {
 	void (*irq_config_func)(const struct device *dev);
 };
 
-static void wait_synchronization(TcCount32 *regs)
+static void wait_synchronization(uintptr_t regs)
 {
-#if defined(TC_SYNCBUSY_MASK)
+#if !defined(CONFIG_SOC_SERIES_SAMD20) && !defined(CONFIG_SOC_SERIES_SAMD21) &&                    \
+	!defined(CONFIG_SOC_SERIES_SAMR21)
 	/* SYNCBUSY is a register */
-	while ((regs->SYNCBUSY.reg & TC_SYNCBUSY_MASK) != 0) {
-	}
-#elif defined(TC_STATUS_SYNCBUSY)
-	/* SYNCBUSY is a bit */
-	while ((regs->STATUS.reg & TC_STATUS_SYNCBUSY) != 0) {
+	while ((sys_read32(regs + SYNCBUSY_OFFSET) & SYNCBUSY_MASK) != 0) {
 	}
 #else
-#error Unsupported device
+	/* SYNCBUSY is a bit */
+	while ((sys_read8(regs + STATUS_OFFSET) & STATUS_SYNCBUSY) != 0) {
+	}
 #endif
 }
 
-static void read_synchronize_count(TcCount32 *regs)
+static void read_synchronize_count(uintptr_t regs)
 {
-#if defined(TC_READREQ_RREQ)
-	regs->READREQ.reg = TC_READREQ_RREQ |
-			    TC_READREQ_ADDR(TC_COUNT32_COUNT_OFFSET);
-	wait_synchronization(regs);
-#elif defined(TC_CTRLBSET_CMD_READSYNC)
-	regs->CTRLBSET.reg = TC_CTRLBSET_CMD_READSYNC;
-	wait_synchronization(regs);
+#if defined(READREQ_OFFSET)
+	sys_write16(READREQ_RREQ | READREQ_ADDR(COUNT_OFFSET), regs + READREQ_OFFSET);
 #else
-	ARG_UNUSED(regs);
+	uint8_t ctrlbset = sys_read8(regs + CTRLBSET_OFFSET) & ~CTRLBSET_CMD_MASK;
+
+	sys_write8(ctrlbset | CTRLBSET_CMD_READSYNC, regs + CTRLBSET_OFFSET);
 #endif
+	wait_synchronization(regs);
 }
 
 static int counter_sam0_tc32_start(const struct device *dev)
 {
 	const struct counter_sam0_tc32_config *const cfg = dev->config;
-	TcCount32 *tc = cfg->regs;
+	uintptr_t tc = cfg->regs;
 
 	/*
 	 * This will also reset the current counter value if it's
 	 * already running.
 	 */
-	tc->CTRLBSET.reg = TC_CTRLBSET_CMD_RETRIGGER;
+	uint8_t ctrlbset = sys_read8(tc + CTRLBSET_OFFSET) & ~CTRLBSET_CMD_MASK;
+
+	sys_write8(ctrlbset | CTRLBSET_CMD_RETRIGGER, tc + CTRLBSET_OFFSET);
 	wait_synchronization(tc);
 	return 0;
 }
@@ -88,7 +88,7 @@ static int counter_sam0_tc32_start(const struct device *dev)
 static int counter_sam0_tc32_stop(const struct device *dev)
 {
 	const struct counter_sam0_tc32_config *const cfg = dev->config;
-	TcCount32 *tc = cfg->regs;
+	uintptr_t tc = cfg->regs;
 
 	/*
 	 * The older (pre SAML1x) manuals claim the counter retains its
@@ -96,7 +96,9 @@ static int counter_sam0_tc32_stop(const struct device *dev)
 	 * The SAML1x manual says it resets, which is what the SAMD21
 	 * counter actually appears to do.
 	 */
-	tc->CTRLBSET.reg = TC_CTRLBSET_CMD_STOP;
+	uint8_t ctrlbset = sys_read8(tc + CTRLBSET_OFFSET) & ~CTRLBSET_CMD_MASK;
+
+	sys_write8(ctrlbset | CTRLBSET_CMD_STOP, tc + CTRLBSET_OFFSET);
 	wait_synchronization(tc);
 	return 0;
 }
@@ -104,10 +106,10 @@ static int counter_sam0_tc32_stop(const struct device *dev)
 static uint32_t counter_sam0_tc32_read(const struct device *dev)
 {
 	const struct counter_sam0_tc32_config *const cfg = dev->config;
-	TcCount32 *tc = cfg->regs;
+	uintptr_t tc = cfg->regs;
 
 	read_synchronize_count(tc);
-	return tc->COUNT.reg;
+	return sys_read32(tc + COUNT_OFFSET);
 }
 
 static int counter_sam0_tc32_get_value(const struct device *dev,
@@ -122,30 +124,30 @@ static void counter_sam0_tc32_relative_alarm(const struct device *dev,
 {
 	struct counter_sam0_tc32_data *data = dev->data;
 	const struct counter_sam0_tc32_config *const cfg = dev->config;
-	TcCount32 *tc = cfg->regs;
+	uintptr_t tc = cfg->regs;
 	uint32_t before;
 	uint32_t target;
 	uint32_t after;
 	uint32_t max;
 
 	read_synchronize_count(tc);
-	before = tc->COUNT.reg;
+	before = sys_read32(tc + COUNT_OFFSET);
 
 	target = before + ticks;
-	max = tc->CC[0].reg;
+	max = sys_read32(tc + CC0_OFFSET);
 	if (target > max) {
 		target -= max;
 	}
 
-	tc->CC[1].reg = target;
+	sys_write32(target, tc + CC1_OFFSET);
 	wait_synchronization(tc);
-	tc->INTFLAG.reg = TC_INTFLAG_MC1;
+	sys_write8(INTFLAG_MC1, tc + INTFLAG_OFFSET);
 
 	read_synchronize_count(tc);
-	after = tc->COUNT.reg;
+	after = sys_read32(tc + COUNT_OFFSET);
 
 	/* Pending now, so no further checking required */
-	if (tc->INTFLAG.bit.MC1) {
+	if (sys_read8(tc + INTFLAG_OFFSET) & INTFLAG_MC1) {
 		goto out_future;
 	}
 
@@ -164,8 +166,8 @@ static void counter_sam0_tc32_relative_alarm(const struct device *dev,
 
 	counter_alarm_callback_t cb = data->ch.callback;
 
-	tc->INTENCLR.reg = TC_INTENCLR_MC1;
-	tc->INTFLAG.reg = TC_INTFLAG_MC1;
+	sys_write8(INTENCLR_MC1, tc + INTENCLR_OFFSET);
+	sys_write8(INTFLAG_MC1, tc + INTFLAG_OFFSET);
 	data->ch.callback = NULL;
 
 	cb(dev, 0, target, data->ch.user_data);
@@ -173,7 +175,7 @@ static void counter_sam0_tc32_relative_alarm(const struct device *dev,
 	return;
 
 out_future:
-	tc->INTENSET.reg = TC_INTFLAG_MC1;
+	sys_write8(INTENSET_MC1, tc + INTENSET_OFFSET);
 }
 
 static int counter_sam0_tc32_set_alarm(const struct device *dev,
@@ -182,11 +184,11 @@ static int counter_sam0_tc32_set_alarm(const struct device *dev,
 {
 	struct counter_sam0_tc32_data *data = dev->data;
 	const struct counter_sam0_tc32_config *const cfg = dev->config;
-	TcCount32 *tc = cfg->regs;
+	uintptr_t tc = cfg->regs;
 
 	ARG_UNUSED(chan_id);
 
-	if (alarm_cfg->ticks > tc->CC[0].reg) {
+	if (alarm_cfg->ticks > sys_read32(tc + CC0_OFFSET)) {
 		return -EINVAL;
 	}
 
@@ -201,10 +203,10 @@ static int counter_sam0_tc32_set_alarm(const struct device *dev,
 	data->ch.user_data = alarm_cfg->user_data;
 
 	if ((alarm_cfg->flags & COUNTER_ALARM_CFG_ABSOLUTE) != 0) {
-		tc->CC[1].reg = alarm_cfg->ticks;
+		sys_write32(alarm_cfg->ticks, tc + CC1_OFFSET);
 		wait_synchronization(tc);
-		tc->INTFLAG.reg = TC_INTFLAG_MC1;
-		tc->INTENSET.reg = TC_INTFLAG_MC1;
+		sys_write8(INTFLAG_MC1, tc + INTFLAG_OFFSET);
+		sys_write8(INTENSET_MC1, tc + INTENSET_OFFSET);
 	} else {
 		counter_sam0_tc32_relative_alarm(dev, alarm_cfg->ticks);
 	}
@@ -219,15 +221,15 @@ static int counter_sam0_tc32_cancel_alarm(const struct device *dev,
 {
 	struct counter_sam0_tc32_data *data = dev->data;
 	const struct counter_sam0_tc32_config *const cfg = dev->config;
-	TcCount32 *tc = cfg->regs;
+	uintptr_t tc = cfg->regs;
 
 	unsigned int key = irq_lock();
 
 	ARG_UNUSED(chan_id);
 
 	data->ch.callback = NULL;
-	tc->INTENCLR.reg = TC_INTENCLR_MC1;
-	tc->INTFLAG.reg = TC_INTFLAG_MC1;
+	sys_write8(INTENCLR_MC1, tc + INTENCLR_OFFSET);
+	sys_write8(INTFLAG_MC1, tc + INTFLAG_OFFSET);
 
 	irq_unlock(key);
 	return 0;
@@ -238,7 +240,7 @@ static int counter_sam0_tc32_set_top_value(const struct device *dev,
 {
 	struct counter_sam0_tc32_data *data = dev->data;
 	const struct counter_sam0_tc32_config *const cfg = dev->config;
-	TcCount32 *tc = cfg->regs;
+	uintptr_t tc = cfg->regs;
 	int err = 0;
 	unsigned int key = irq_lock();
 
@@ -250,12 +252,13 @@ static int counter_sam0_tc32_set_top_value(const struct device *dev,
 	if (top_cfg->callback) {
 		data->top_cb = top_cfg->callback;
 		data->top_user_data = top_cfg->user_data;
-		tc->INTENSET.reg = TC_INTFLAG_MC0;
+		sys_write8(INTENSET_MC0, tc + INTENSET_OFFSET);
 	} else {
-		tc->INTENCLR.reg = TC_INTFLAG_MC0;
+		sys_write8(INTENCLR_MC0, tc + INTENCLR_OFFSET);
 	}
 
-	tc->CC[0].reg = top_cfg->ticks;
+	sys_write32(top_cfg->ticks, tc + CC0_OFFSET);
+	uint8_t ctrlbset = sys_read8(tc + CTRLBSET_OFFSET) & ~CTRLBSET_CMD_MASK;
 
 	if (top_cfg->flags & COUNTER_TOP_CFG_DONT_RESET) {
 		/*
@@ -265,16 +268,16 @@ static int counter_sam0_tc32_set_top_value(const struct device *dev,
 		if (counter_sam0_tc32_read(dev) >= top_cfg->ticks) {
 			err = -ETIME;
 			if (top_cfg->flags & COUNTER_TOP_CFG_RESET_WHEN_LATE) {
-				tc->CTRLBSET.reg = TC_CTRLBSET_CMD_RETRIGGER;
+				sys_write8(ctrlbset | CTRLBSET_CMD_RETRIGGER, tc + CTRLBSET_OFFSET);
 			}
 		}
 	} else {
-		tc->CTRLBSET.reg = TC_CTRLBSET_CMD_RETRIGGER;
+		sys_write8(ctrlbset | CTRLBSET_CMD_RETRIGGER, tc + CTRLBSET_OFFSET);
 	}
 
 	wait_synchronization(tc);
 
-	tc->INTFLAG.reg = TC_INTFLAG_MC0;
+	sys_write8(INTFLAG_MC0, tc + INTFLAG_OFFSET);
 	irq_unlock(key);
 	return err;
 }
@@ -282,46 +285,46 @@ static int counter_sam0_tc32_set_top_value(const struct device *dev,
 static uint32_t counter_sam0_tc32_get_pending_int(const struct device *dev)
 {
 	const struct counter_sam0_tc32_config *const cfg = dev->config;
-	TcCount32 *tc = cfg->regs;
+	uintptr_t tc = cfg->regs;
 
-	return tc->INTFLAG.reg & (TC_INTFLAG_MC0 | TC_INTFLAG_MC1);
+	return sys_read8(tc + INTFLAG_OFFSET) & (INTFLAG_MC0 | INTFLAG_MC1);
 }
 
 static uint32_t counter_sam0_tc32_get_top_value(const struct device *dev)
 {
 	const struct counter_sam0_tc32_config *const cfg = dev->config;
-	TcCount32 *tc = cfg->regs;
+	uintptr_t tc = cfg->regs;
 
 	/*
 	 * Unsync read is safe here because we're not using
 	 * capture mode, so things are only set from the CPU
 	 * end.
 	 */
-	return tc->CC[0].reg;
+	return sys_read32(tc + CC0_OFFSET);
 }
 
 static void counter_sam0_tc32_isr(const struct device *dev)
 {
 	struct counter_sam0_tc32_data *data = dev->data;
 	const struct counter_sam0_tc32_config *const cfg = dev->config;
-	TcCount32 *tc = cfg->regs;
-	uint8_t status = tc->INTFLAG.reg;
+	uintptr_t tc = cfg->regs;
+	uint8_t status = sys_read8(tc + INTFLAG_OFFSET);
 
 	/* Acknowledge all interrupts */
-	tc->INTFLAG.reg = status;
+	sys_write8(status, tc + INTFLAG_OFFSET);
 
-	if (status & TC_INTFLAG_MC1) {
+	if (status & INTFLAG_MC1) {
 		if (data->ch.callback) {
 			counter_alarm_callback_t cb = data->ch.callback;
 
-			tc->INTENCLR.reg = TC_INTENCLR_MC1;
+			sys_write8(INTENCLR_MC1, tc + INTENCLR_OFFSET);
 			data->ch.callback = NULL;
 
-			cb(dev, 0, tc->CC[1].reg, data->ch.user_data);
+			cb(dev, 0, sys_read32(tc + CC1_OFFSET), data->ch.user_data);
 		}
 	}
 
-	if (status & TC_INTFLAG_MC0) {
+	if (status & INTFLAG_MC0) {
 		if (data->top_cb) {
 			data->top_cb(dev, data->top_user_data);
 		}
@@ -331,18 +334,19 @@ static void counter_sam0_tc32_isr(const struct device *dev)
 static int counter_sam0_tc32_initialize(const struct device *dev)
 {
 	const struct counter_sam0_tc32_config *const cfg = dev->config;
-	TcCount32 *tc = cfg->regs;
+	const uintptr_t gclk = DT_REG_ADDR(DT_INST(0, atmel_sam0_gclk));
+	uintptr_t tc = cfg->regs;
 	int retval;
 
 	*cfg->mclk |= cfg->mclk_mask;
 
-#ifdef MCLK
-	GCLK->PCHCTRL[cfg->gclk_id].reg = GCLK_PCHCTRL_CHEN
-					| GCLK_PCHCTRL_GEN(cfg->gclk_gen);
+#if !defined(CONFIG_SOC_SERIES_SAMD20) && !defined(CONFIG_SOC_SERIES_SAMD21) &&                    \
+	!defined(CONFIG_SOC_SERIES_SAMR21)
+	sys_write32(PCHCTRL_CHEN | PCHCTRL_GEN(cfg->gclk_gen),
+		    gclk + PCHCTRL_OFFSET + (4 * cfg->gclk_id));
 #else
-	GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN
-			  | GCLK_CLKCTRL_GEN(cfg->gclk_gen)
-			  | GCLK_CLKCTRL_ID(cfg->gclk_id);
+	sys_write16(CLKCTRL_CLKEN | CLKCTRL_GEN(cfg->gclk_gen) | CLKCTRL_ID(cfg->gclk_id),
+		    gclk + CLKCTRL_OFFSET);
 #endif
 
 	/*
@@ -350,19 +354,15 @@ static int counter_sam0_tc32_initialize(const struct device *dev)
 	 * use MFRQ mode which uses CC0 as the top at the expense of only
 	 * having CC1 available for alarms.
 	 */
-	tc->CTRLA.reg = TC_CTRLA_MODE_COUNT32 |
-#ifdef TC_CTRLA_WAVEGEN_MFRQ
-			TC_CTRLA_WAVEGEN_MFRQ |
-#endif
-			cfg->prescaler;
+	sys_write16(CTRLA_MODE_COUNT32 | CTRLA_WAVEGEN_MFRQ | cfg->prescaler, tc + CTRLA_OFFSET);
 	wait_synchronization(tc);
 
-#ifdef TC_WAVE_WAVEGEN_MFRQ
-	tc->WAVE.reg = TC_WAVE_WAVEGEN_MFRQ;
+#ifdef WAVE_WAVEGEN_MFRQ
+	sys_write8(WAVE_WAVEGEN_MFRQ, tc + WAVE_OFFSET);
 #endif
 
 	/* Disable all interrupts */
-	tc->INTENCLR.reg = TC_INTENCLR_MASK;
+	sys_write8(INTENCLR_MASK, tc + INTENCLR_OFFSET);
 
 	retval = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_DEFAULT);
 	if (retval < 0) {
@@ -370,15 +370,21 @@ static int counter_sam0_tc32_initialize(const struct device *dev)
 	}
 
 	/* Set the initial top as the maximum */
-	tc->CC[0].reg = UINT32_MAX;
+	sys_write32(UINT32_MAX, tc + CC0_OFFSET);
 
 	cfg->irq_config_func(dev);
 
-	tc->CTRLA.bit.ENABLE = 1;
+	uint16_t ctrla = sys_read16(tc + CTRLA_OFFSET);
+
+	WRITE_BIT(ctrla, CTRLA_ENABLE_BIT, 1);
+	sys_write16(ctrla, tc + CTRLA_OFFSET);
+
 	wait_synchronization(tc);
 
 	/* Stop the counter initially */
-	tc->CTRLBSET.reg = TC_CTRLBSET_CMD_STOP;
+	uint8_t ctrlbset = sys_read8(tc + CTRLBSET_OFFSET) & ~CTRLBSET_CMD_MASK;
+
+	sys_write8(ctrlbset | CTRLBSET_CMD_STOP, tc + CTRLBSET_OFFSET);
 	wait_synchronization(tc);
 
 	return 0;
@@ -396,8 +402,26 @@ static DEVICE_API(counter, counter_sam0_tc32_driver_api) = {
 };
 
 
-#define ASSIGNED_CLOCKS_CELL_BY_NAME						\
-	ATMEL_SAM0_DT_INST_ASSIGNED_CLOCKS_CELL_BY_NAME
+#ifndef ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET
+#define ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET(n, cell)			\
+	(volatile uint32_t *)							\
+	(DT_REG_ADDR(DT_INST_PHANDLE_BY_NAME(n, clocks, cell)) +		\
+	 DT_INST_CLOCKS_CELL_BY_NAME(n, cell, offset))
+#endif
+
+#ifndef ATMEL_SAM0_DT_INST_MCLK_PM_REG_ADDR_OFFSET
+#define ATMEL_SAM0_DT_INST_MCLK_PM_REG_ADDR_OFFSET(n)				\
+	COND_CODE_1(DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(mclk)),		\
+		(ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET(n, mclk)),		\
+		(ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET(n, pm)))
+#endif
+
+#ifndef ATMEL_SAM0_DT_INST_MCLK_PM_PERIPH_MASK
+#define ATMEL_SAM0_DT_INST_MCLK_PM_PERIPH_MASK(n, cell)				\
+	COND_CODE_1(DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(mclk)),		\
+		(BIT(DT_INST_CLOCKS_CELL_BY_NAME(n, mclk, cell))),		\
+		(BIT(DT_INST_CLOCKS_CELL_BY_NAME(n, pm, cell))))
+#endif
 
 #define SAM0_TC32_PRESCALER(n)							\
 	COND_CODE_1(DT_INST_NODE_HAS_PROP(n, prescaler),			\
@@ -411,17 +435,17 @@ static DEVICE_API(counter, counter_sam0_tc32_driver_api) = {
 	counter_sam0_tc32_dev_config_##n = {					\
 		.info = {							\
 			.max_top_value = UINT32_MAX,				\
-			.freq = SOC_ATMEL_SAM0_GCLK0_FREQ_HZ /			\
+			.freq = CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC /		\
 				SAM0_TC32_PRESCALER(n),				\
 			.flags = COUNTER_CONFIG_INFO_COUNT_UP,			\
 			.channels = 1						\
 		},								\
-		.regs = (TcCount32 *)DT_INST_REG_ADDR(n),			\
-		.gclk_gen = ASSIGNED_CLOCKS_CELL_BY_NAME(n, gclk, gen),		\
+		.regs = DT_INST_REG_ADDR(n),					\
+		.gclk_gen = DT_PHA_BY_NAME(DT_DRV_INST(n), atmel_assigned_clocks, gclk, gen), \
 		.gclk_id = DT_INST_CLOCKS_CELL_BY_NAME(n, gclk, id),		\
 		.mclk = ATMEL_SAM0_DT_INST_MCLK_PM_REG_ADDR_OFFSET(n),		\
 		.mclk_mask = ATMEL_SAM0_DT_INST_MCLK_PM_PERIPH_MASK(n, bit),	\
-		.prescaler = UTIL_CAT(TC_CTRLA_PRESCALER_DIV,			\
+		.prescaler = UTIL_CAT(CTRLA_PRESCALER_DIV,			\
 				      SAM0_TC32_PRESCALER(n)),			\
 		.irq_config_func = &counter_sam0_tc32_config_##n,		\
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(n),			\
