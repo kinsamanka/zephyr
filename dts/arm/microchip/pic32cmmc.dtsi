@@ -141,6 +141,94 @@
 			atmel,assigned-clock-names = "GCLK";
 			status = "disabled";
 		};
+
+		tcc0: tcc0@42002400 {
+			compatible = "atmel,sam0-tcc";
+			reg = <0x42002400 0x80>;
+			interrupts = <13 0>;
+			clocks = <&gclk 23>, <&mclk 28 9>;
+			clock-names = "GCLK", "MCLK";
+			atmel,assigned-clocks = <&gclk 0>;
+			atmel,assigned-clock-names = "GCLK";
+			status = "disabled";
+		};
+
+		tcc1: tcc1@42002800 {
+			compatible = "atmel,sam0-tcc";
+			reg = <0x42002800 0x80>;
+			interrupts = <14 0>;
+			clocks = <&gclk 23>, <&mclk 28 10>;
+			clock-names = "GCLK", "MCLK";
+			atmel,assigned-clocks = <&gclk 0>;
+			atmel,assigned-clock-names = "GCLK";
+			status = "disabled";
+		};
+
+		tcc2: tcc2@42002c00 {
+			compatible = "atmel,sam0-tcc";
+			reg = <0x42002c00 0x80>;
+			interrupts = <15 0>;
+			clocks = <&gclk 24>, <&mclk 28 11>;
+			clock-names = "GCLK", "MCLK";
+			atmel,assigned-clocks = <&gclk 0>;
+			atmel,assigned-clock-names = "GCLK";
+			status = "disabled";
+		};
+
+		tc0: tc0@42003000 {
+			compatible = "atmel,sam0-tc";
+			reg = <0x42003000 0x38>;
+			interrupts = <16 0>;
+			clocks = <&gclk 25>, <&mclk 28 12>;
+			clock-names = "GCLK", "MCLK";
+			atmel,assigned-clocks = <&gclk 0>;
+			atmel,assigned-clock-names = "GCLK";
+			status = "disabled";
+		};
+
+		tc1: tc1@42003400 {
+			compatible = "atmel,sam0-tc";
+			reg = <0x42003400 0x38>;
+			interrupts = <17 0>;
+			clocks = <&gclk 25>, <&mclk 28 13>;
+			clock-names = "GCLK", "MCLK";
+			atmel,assigned-clocks = <&gclk 0>;
+			atmel,assigned-clock-names = "GCLK";
+			status = "disabled";
+		};
+
+		tc2: tc2@42003800 {
+			compatible = "atmel,sam0-tc";
+			reg = <0x42003800 0x38>;
+			interrupts = <18 0>;
+			clocks = <&gclk 26>, <&mclk 28 14>;
+			clock-names = "GCLK", "MCLK";
+			atmel,assigned-clocks = <&gclk 0>;
+			atmel,assigned-clock-names = "GCLK";
+			status = "disabled";
+		};
+
+		tc3: tc3@42003c00 {
+			compatible = "atmel,sam0-tc";
+			reg = <0x42003c00 0x38>;
+			interrupts = <19 0>;
+			clocks = <&gclk 26>, <&mclk 28 15>;
+			clock-names = "GCLK", "MCLK";
+			atmel,assigned-clocks = <&gclk 0>;
+			atmel,assigned-clock-names = "GCLK";
+			status = "disabled";
+		};
+
+		tc4: tc4@42004000 {
+			compatible = "atmel,sam0-tc";
+			reg = <0x42004000 0x38>;
+			interrupts = <20 0>;
+			clocks = <&gclk 27>, <&mclk 28 16>;
+			clock-names = "GCLK", "MCLK";
+			atmel,assigned-clocks = <&gclk 0>;
+			atmel,assigned-clock-names = "GCLK";
+			status = "disabled";
+		};
 	};
 
 	sram0: memory@20000000 {
