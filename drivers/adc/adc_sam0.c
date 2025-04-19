@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2019 Derek Hageman <hageman@inthat.cloud>
  * Copyright (c) 2024 Gerson Fernando Budke <nandojve@gmail.com>
+ * Copyright (c) 2025 GP Orcullo
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #define DT_DRV_COMPAT atmel_sam0_adc
 
-#include <soc.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/pinctrl.h>
 
@@ -18,7 +18,10 @@ LOG_MODULE_REGISTER(adc_sam0, CONFIG_ADC_LOG_LEVEL);
 /* clang-format off */
 
 #define ADC_CONTEXT_USES_KERNEL_TIMER
+
 #include "adc_context.h"
+#include "adc_sam0.h"
+
 
 #if defined(CONFIG_SOC_SERIES_SAMD21) || defined(CONFIG_SOC_SERIES_SAMR21) || \
 	defined(CONFIG_SOC_SERIES_SAMD20)
@@ -47,7 +50,7 @@ struct adc_sam0_data {
 };
 
 struct adc_sam0_cfg {
-	Adc *regs;
+	uintptr_t regs;
 	const struct pinctrl_dev_config *pcfg;
 	volatile uint32_t *mclk;
 	uint32_t mclk_mask;
@@ -58,10 +61,18 @@ struct adc_sam0_cfg {
 	void (*config_func)(const struct device *dev);
 };
 
-static void wait_synchronization(Adc *const adc)
+static void wait_synchronization(uintptr_t const adc)
 {
-	while ((ADC_SYNC(adc) & ADC_SYNC_MASK) != 0) {
+#if defined(CONFIG_SOC_SERIES_SAMD20) || defined(CONFIG_SOC_SERIES_SAMD21) ||                      \
+	defined(CONFIG_SOC_SERIES_SAMR21)
+	/* SYNCBUSY is a bit */
+	while (sys_read8(adc + STATUS_OFFSET) & STATUS_SYNCBUSY) {
 	}
+#else
+	/* SYNCBUSY is a register */
+	while ((sys_read32(adc + SYNCBUSY_OFFSET) & SYNCBUSY_MASK) != 0) {
+	}
+#endif
 }
 
 static int adc_sam0_acquisition_to_clocks(const struct device *dev,
@@ -113,7 +124,7 @@ static int adc_sam0_channel_setup(const struct device *dev,
 				  const struct adc_channel_cfg *channel_cfg)
 {
 	const struct adc_sam0_cfg *const cfg = dev->config;
-	Adc *const adc = cfg->regs;
+	uintptr_t const adc = cfg->regs;
 	int retval;
 	uint8_t sampctrl = 0;
 
@@ -125,49 +136,53 @@ static int adc_sam0_channel_setup(const struct device *dev,
 			return retval;
 		}
 
-		sampctrl |= ADC_SAMPCTRL_SAMPLEN(retval);
+		sampctrl |= SAMPCTRL_SAMPLEN(retval);
 	}
 
-	adc->SAMPCTRL.reg = sampctrl;
+	sys_write8(sampctrl, adc + SAMPCTRL_OFFSET);
 	wait_synchronization(adc);
 
 	uint8_t refctrl;
 
 	switch (channel_cfg->reference) {
 	case ADC_REF_INTERNAL:
-		refctrl = ADC_REFCTRL_REFSEL_INTERNAL | ADC_REFCTRL_REFCOMP;
+		refctrl = REFCTRL_REFSEL_INTREF | REFCTRL_REFCOMP;
 		/* Enable the internal bandgap reference */
-		ADC_BGEN = 1;
+		sys_set_bit(VREF_ADDR, VREF_BGREF_BIT);
 		break;
-#ifdef ADC_REFCTRL_REFSEL_VDD_1
+#ifdef REFCTRL_REFSEL_VDD_1
 	case ADC_REF_VDD_1:
-		refctrl = ADC_REFCTRL_REFSEL_VDD_1 | ADC_REFCTRL_REFCOMP;
+		refctrl = REFCTRL_REFSEL_VDD_1 | REFCTRL_REFCOMP;
 		break;
 #endif
 	case ADC_REF_VDD_1_2:
-		refctrl = ADC_REFCTRL_REFSEL_VDD_1_2 | ADC_REFCTRL_REFCOMP;
+		refctrl = REFCTRL_REFSEL_VDD_1_2 | REFCTRL_REFCOMP;
 		break;
 	case ADC_REF_EXTERNAL0:
-		refctrl = ADC_REFCTRL_REFSEL_AREFA;
+		refctrl = REFCTRL_REFSEL_AREFA;
 		break;
-#ifdef ADC_REFCTRL_REFSEL_AREFB
+#ifdef REFCTRL_REFSEL_AREFB
 	case ADC_REF_EXTERNAL1:
-		refctrl = ADC_REFCTRL_REFSEL_AREFB;
+		refctrl = REFCTRL_REFSEL_AREFB;
 		break;
 #endif
 	default:
 		LOG_ERR("Selected reference is not valid");
 		return -EINVAL;
 	}
-	if (adc->REFCTRL.reg != refctrl) {
+	if (sys_read8(adc + REFCTRL_OFFSET) != refctrl) {
 #ifdef ADC_SAM0_REFERENCE_ENABLE_PROTECTED
-		adc->CTRLA.bit.ENABLE = 0;
+		uint8_t ctrla = sys_read8(adc + CTRLA_OFFSET);
+
+		WRITE_BIT(ctrla, CTRLA_ENABLE_BIT, 0);
+		sys_write8(ctrla, adc + CTRLA_OFFSET);
 		wait_synchronization(adc);
 #endif
-		adc->REFCTRL.reg = refctrl;
+		sys_write8(refctrl, adc + REFCTRL_OFFSET);
 		wait_synchronization(adc);
 #ifdef ADC_SAM0_REFERENCE_ENABLE_PROTECTED
-		adc->CTRLA.bit.ENABLE = 1;
+		WRITE_BIT(ctrla, CTRLA_ENABLE_BIT, 1);
+		sys_write8(ctrla, adc + CTRLA_OFFSET);
 		wait_synchronization(adc);
 #endif
 #ifdef ADC_SAM0_REFERENCE_GLITCH
@@ -215,40 +230,43 @@ static int adc_sam0_channel_setup(const struct device *dev,
 		return -EINVAL;
 	}
 
-	inputctrl |= ADC_INPUTCTRL_MUXPOS(channel_cfg->input_positive);
+	inputctrl |= INPUTCTRL_MUXPOS(channel_cfg->input_positive);
+	uint8_t diff = sys_read8(adc + DIFFMODE_OFFSET);
+
 	if (channel_cfg->differential) {
-		inputctrl |= ADC_INPUTCTRL_MUXNEG(channel_cfg->input_negative);
+		inputctrl |= INPUTCTRL_MUXNEG(channel_cfg->input_negative);
 
-		ADC_DIFF(adc) |= ADC_DIFF_MASK;
+		diff |= DIFFMODE_MASK;
 	} else {
-		inputctrl |= ADC_INPUTCTRL_MUXNEG_GND;
+		inputctrl |= INPUTCTRL_MUXNEG_GND;
 
-		ADC_DIFF(adc) &= ~ADC_DIFF_MASK;
+		diff &= ~DIFFMODE_MASK;
 	}
+	sys_write8(diff, adc + DIFFMODE_OFFSET);
 	wait_synchronization(adc);
 
-	adc->INPUTCTRL.reg = inputctrl;
+	sys_write16(inputctrl, adc + INPUTCTRL_OFFSET);
 	wait_synchronization(adc);
 
 	/* Enable references if they're selected */
 	switch (channel_cfg->input_positive) {
-#ifdef ADC_INPUTCTRL_MUXPOS_TEMP_Val
-	case ADC_INPUTCTRL_MUXPOS_TEMP_Val:
-		ADC_TSEN = 1;
+#ifdef INPUTCTRL_MUXPOS_TEMP
+	case INPUTCTRL_MUXPOS_TEMP:
+		sys_set_bit(VREF_ADDR, VREF_TSEN_BIT);
 		break;
 #endif
-#ifdef ADC_INPUTCTRL_MUXPOS_PTAT_Val
-	case ADC_INPUTCTRL_MUXPOS_PTAT_Val:
-		ADC_TSEN = 1;
+#ifdef INPUTCTRL_MUXPOS_PTAT
+	case INPUTCTRL_MUXPOS_PTAT:
+		sys_set_bit(VREF_ADDR, VREF_TSEN_BIT);
 		break;
 #endif
-#ifdef ADC_INPUTCTRL_MUXPOS_CTAT_Val
-	case ADC_INPUTCTRL_MUXPOS_CTAT_Val:
-		ADC_TSEN = 1;
+#ifdef INPUTCTRL_MUXPOS_CTAT
+	case INPUTCTRL_MUXPOS_CTAT:
+		sys_set_bit(VREF_ADDR, VREF_TSEN_BIT);
 		break;
 #endif
-	case ADC_INPUTCTRL_MUXPOS_BANDGAP_Val:
-		ADC_BGEN = 1;
+	case INPUTCTRL_MUXPOS_BANDGAP:
+		sys_set_bit(VREF_ADDR, VREF_BGREF_BIT);
 		break;
 	default:
 		break;
@@ -260,11 +278,11 @@ static int adc_sam0_channel_setup(const struct device *dev,
 static void adc_sam0_start_conversion(const struct device *dev)
 {
 	const struct adc_sam0_cfg *const cfg = dev->config;
-	Adc *const adc = cfg->regs;
+	uintptr_t const adc = cfg->regs;
 
 	LOG_DBG("Starting conversion");
 
-	adc->SWTRIG.reg = ADC_SWTRIG_START;
+	sys_write8(SWTRIG_START, adc + SWTRIG_OFFSET);
 	/*
 	 * Should be safe to not synchronize here because the only things
 	 * that might access the ADC after this will wait for it to complete
@@ -314,7 +332,8 @@ static int start_read(const struct device *dev,
 {
 	const struct adc_sam0_cfg *const cfg = dev->config;
 	struct adc_sam0_data *data = dev->data;
-	Adc *const adc = cfg->regs;
+	uintptr_t const adc = cfg->regs;
+	uint8_t avgctrl;
 	int error;
 
 	if (sequence->oversampling > 10U) {
@@ -322,24 +341,29 @@ static int start_read(const struct device *dev,
 		return -EINVAL;
 	}
 
-	adc->AVGCTRL.reg = ADC_AVGCTRL_SAMPLENUM(sequence->oversampling);
 	if (sequence->oversampling < 4) {
-		adc->AVGCTRL.reg |= ADC_AVGCTRL_ADJRES(sequence->oversampling);
+		avgctrl = AVGCTRL_ADJRES(sequence->oversampling);
 	} else {
-		adc->AVGCTRL.reg |= ADC_AVGCTRL_ADJRES(4);
+		avgctrl = AVGCTRL_ADJRES(4);
 	}
-
-	/* AVGCTRL is not synchronized */
-
 #ifdef CONFIG_SOC_SERIES_SAMD20
 	/*
 	 * Errata: silicon revisions B and C do not perform the automatic right
 	 * shifts in accumulation
 	 */
-	if (sequence->oversampling > 4U && DSU->DID.bit.REVISION < 3) {
-		adc->AVGCTRL.bit.ADJRES = sequence->oversampling - 4U;
+	uint32_t rev = FIELD_GET(DID_REVISION_MASK, sys_read32(REG_DSU_DID_ADDR));
+
+	if (sequence->oversampling > 4U && rev < 3) {
+		avgctrl = AVGCTRL_ADJRES(sequence->oversampling - 4U);
 	}
 #endif
+
+	avgctrl |= AVGCTRL_SAMPLENUM(sequence->oversampling);
+	sys_write8(avgctrl, adc + AVGCTRL_OFFSET);
+
+	/* AVGCTRL is not synchronized */
+
+	uint16_t ressel = sys_read16(adc + RESSEL_OFFSET) & ~RESSEL_MASK;
 
 	switch (sequence->resolution) {
 	case 8:
@@ -348,7 +372,7 @@ static int start_read(const struct device *dev,
 			return -EINVAL;
 		}
 
-		ADC_RESSEL(adc) = ADC_RESSEL_8BIT;
+		ressel |= RESSEL_8BIT;
 		break;
 	case 10:
 		if (sequence->oversampling) {
@@ -356,13 +380,13 @@ static int start_read(const struct device *dev,
 			return -EINVAL;
 		}
 
-		ADC_RESSEL(adc) = ADC_RESSEL_10BIT;
+		ressel |= RESSEL_10BIT;
 		break;
 	case 12:
 		if (sequence->oversampling) {
-			ADC_RESSEL(adc) = ADC_RESSEL_16BIT;
+			ressel |= RESSEL_16BIT;
 		} else {
-			ADC_RESSEL(adc) = ADC_RESSEL_12BIT;
+			ressel |= RESSEL_12BIT;
 		}
 		break;
 	default:
@@ -370,7 +394,7 @@ static int start_read(const struct device *dev,
 			sequence->resolution);
 		return -EINVAL;
 	}
-
+	sys_write16(ressel, adc + RESSEL_OFFSET);
 	wait_synchronization(adc);
 
 	if ((sequence->channels == 0)
@@ -422,12 +446,12 @@ static void adc_sam0_isr(const struct device *dev)
 {
 	struct adc_sam0_data *data = dev->data;
 	const struct adc_sam0_cfg *const cfg = dev->config;
-	Adc *const adc = cfg->regs;
+	uintptr_t const adc = cfg->regs;
 	uint16_t result;
 
-	adc->INTFLAG.reg = ADC_INTFLAG_MASK;
+	sys_write8(INTFLAG_MASK, adc + INTFLAG_OFFSET);
 
-	result = (uint16_t)(adc->RESULT.reg);
+	result = sys_read16(adc + RESULT_OFFSET);
 
 #ifdef ADC_SAM0_REFERENCE_GLITCH
 	if (data->reference_changed) {
@@ -446,19 +470,20 @@ static void adc_sam0_isr(const struct device *dev)
 static int adc_sam0_init(const struct device *dev)
 {
 	const struct adc_sam0_cfg *const cfg = dev->config;
+	const uintptr_t gclk = DT_REG_ADDR(DT_INST(0, atmel_sam0_gclk));
 	struct adc_sam0_data *data = dev->data;
-	Adc *const adc = cfg->regs;
+	uintptr_t const adc = cfg->regs;
 	int retval;
 
 	*cfg->mclk |= cfg->mclk_mask;
 
-#ifdef MCLK
-	GCLK->PCHCTRL[cfg->gclk_id].reg = GCLK_PCHCTRL_CHEN
-					| GCLK_PCHCTRL_GEN(cfg->gclk_gen);
+#if !defined(CONFIG_SOC_SERIES_SAMD20) && !defined(CONFIG_SOC_SERIES_SAMD21) &&                    \
+	!defined(CONFIG_SOC_SERIES_SAMR21)
+	sys_write32(PCHCTRL_CHEN | PCHCTRL_GEN(cfg->gclk_gen),
+		    gclk + PCHCTRL_OFFSET + (4 * cfg->gclk_id));
 #else
-	GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN
-			  | GCLK_CLKCTRL_GEN(cfg->gclk_gen)
-			  | GCLK_CLKCTRL_ID(cfg->gclk_id);
+	sys_write16(CLKCTRL_CLKEN | CLKCTRL_GEN(cfg->gclk_gen) | CLKCTRL_ID(cfg->gclk_id),
+		    gclk + CLKCTRL_OFFSET);
 #endif
 
 	retval = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_DEFAULT);
@@ -466,22 +491,26 @@ static int adc_sam0_init(const struct device *dev)
 		return retval;
 	}
 
-	ADC_PRESCALER(adc) = cfg->prescaler;
+	uint16_t tmp = sys_read16(adc + PRESCALER_OFFSET) & ~PRESCALER_MASK;
+
+	sys_write16(tmp | cfg->prescaler, adc + PRESCALER_OFFSET);
 	wait_synchronization(adc);
 
-	adc->INTENCLR.reg = ADC_INTENCLR_MASK;
-	adc->INTFLAG.reg = ADC_INTFLAG_MASK;
+	sys_write8(INTENCLR_MASK, adc + INTENCLR_OFFSET);
+	sys_write8(INTFLAG_MASK, adc + INTFLAG_OFFSET);
 
 	cfg->config_func(dev);
 
-	adc->INTENSET.reg = ADC_INTENSET_RESRDY;
+	sys_write8(INTENSET_RESRDY, adc + INTENSET_OFFSET);
 
 	data->dev = dev;
 #ifdef ADC_SAM0_REFERENCE_GLITCH
 	data->reference_changed = 1;
 #endif
 
-	adc->CTRLA.bit.ENABLE = 1;
+	uint8_t ctrla = sys_read8(adc + CTRLA_OFFSET);
+
+	sys_write8(ctrla | BIT(CTRLA_ENABLE_BIT), adc + CTRLA_OFFSET);
 	wait_synchronization(adc);
 
 	adc_context_unlock_unconditionally(&data->ctx);
@@ -514,58 +543,68 @@ static DEVICE_API(adc, adc_sam0_api) = {
 #endif
 };
 
-
-#ifdef MCLK
+#if defined(ADC0_BIASCOMP_MASK)
 
 #define ADC_SAM0_CONFIGURE(n)							\
-do {										\
-	const struct adc_sam0_cfg *const cfg = dev->config;			\
-	Adc * const adc = cfg->regs;						\
-	adc->CALIB.reg = ADC_SAM0_BIASCOMP(n)					\
-			 | ADC_SAM0_BIASR2R(n)					\
-			 | ADC_SAM0_BIASREFBUF(n);				\
-} while (false)
+	do {									\
+		const struct adc_sam0_cfg *const cfg = dev->config;		\
+		const uint32_t cal = sys_read32(ADC_FUSES_ADDR);		\
+										\
+		sys_write16(SET_BIAS(n, BIASCOMP, cal) |			\
+				    SET_BIAS(n, BIASR2R, cal) |			\
+				    SET_BIAS(n, BIASREFBUF, cal),		\
+			    cfg->regs + CALIB_OFFSET);				\
+										\
+	} while (false)
 
 #else
 
 #define ADC_SAM0_CONFIGURE(n)							\
-do {										\
-	const struct adc_sam0_cfg *const cfg = dev->config;			\
-	Adc * const adc = cfg->regs;						\
-	/* Linearity is split across two words */				\
-	uint32_t lin = ((*(uint32_t *)ADC_FUSES_LINEARITY_0_ADDR) &		\
-		     ADC_FUSES_LINEARITY_0_Msk) >>				\
-		     ADC_FUSES_LINEARITY_0_Pos;					\
-	lin |= (((*(uint32_t *)ADC_FUSES_LINEARITY_1_ADDR) &			\
-		 ADC_FUSES_LINEARITY_1_Msk) >>					\
-		 ADC_FUSES_LINEARITY_1_Pos) << 4;				\
-	uint32_t bias = ((*(uint32_t *)ADC_FUSES_BIASCAL_ADDR) &		\
-		      ADC_FUSES_BIASCAL_Msk) >> ADC_FUSES_BIASCAL_Pos;		\
-	adc->CALIB.reg = ADC_CALIB_BIAS_CAL(bias) |				\
-			 ADC_CALIB_LINEARITY_CAL(lin);				\
-} while (false)
+	do {									\
+		const struct adc_sam0_cfg *const cfg = dev->config;		\
+		const uint32_t cal = sys_read32(ADC_FUSES_ADDR);		\
+										\
+		sys_write16(SET_BIAS(n, BIAS, cal) |				\
+				    SET_BIAS(n, LINEARITY_1, cal) |		\
+				    SET_BIAS(n, LINEARITY_0, cal),		\
+			    cfg->regs + CALIB_OFFSET);				\
+										\
+	} while (false)
 
 #endif
 
-#define ASSIGNED_CLOCKS_CELL_BY_NAME						\
-	ATMEL_SAM0_DT_INST_ASSIGNED_CLOCKS_CELL_BY_NAME
+#ifndef ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET
+#define ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET(n, cell)			\
+	(volatile uint32_t *)							\
+	(DT_REG_ADDR(DT_INST_PHANDLE_BY_NAME(n, clocks, cell)) +		\
+	 DT_INST_CLOCKS_CELL_BY_NAME(n, cell, offset))
+#endif
 
-#define ADC_SAM0_GCLK_FREQ(n)							\
-	UTIL_CAT(UTIL_CAT(SOC_ATMEL_SAM0_GCLK,					\
-			  ASSIGNED_CLOCKS_CELL_BY_NAME(n, gclk, gen)),		\
-		 _FREQ_HZ)
+#ifndef ATMEL_SAM0_DT_INST_MCLK_PM_REG_ADDR_OFFSET
+#define ATMEL_SAM0_DT_INST_MCLK_PM_REG_ADDR_OFFSET(n)				\
+	COND_CODE_1(DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(mclk)),		\
+		(ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET(n, mclk)),		\
+		(ATMEL_SAM0_DT_INST_CELL_REG_ADDR_OFFSET(n, pm)))
+#endif
+
+#ifndef ATMEL_SAM0_DT_INST_MCLK_PM_PERIPH_MASK
+#define ATMEL_SAM0_DT_INST_MCLK_PM_PERIPH_MASK(n, cell)				\
+	COND_CODE_1(DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(mclk)),		\
+		(BIT(DT_INST_CLOCKS_CELL_BY_NAME(n, mclk, cell))),		\
+		(BIT(DT_INST_CLOCKS_CELL_BY_NAME(n, pm, cell))))
+#endif
 
 #define ADC_SAM0_FREQ(n)							\
-	.prescaler = UTIL_CAT(ADC_CTRLx_PRESCALER_DIV,				\
-			      UTIL_CAT(DT_INST_PROP(n, prescaler), _Val)),	\
-	.freq = ADC_SAM0_GCLK_FREQ(n) / DT_INST_PROP(n, prescaler)
+	.prescaler = UTIL_CAT(PRESCALER_DIV, DT_INST_PROP(n, prescaler)),	\
+	.freq = CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC / DT_INST_PROP(n, prescaler)
 
 #define ADC_SAM0_DEVICE(n)							\
 	PINCTRL_DT_INST_DEFINE(n);						\
 	static void adc_sam0_config_##n(const struct device *dev);		\
 	static const struct adc_sam0_cfg adc_sam_cfg_##n = {			\
-		.regs = (Adc *)DT_INST_REG_ADDR(n),				\
-		.gclk_gen = ASSIGNED_CLOCKS_CELL_BY_NAME(n, gclk, gen),		\
+		.regs = DT_INST_REG_ADDR(n),					\
+		.gclk_gen = DT_PHA_BY_NAME(DT_DRV_INST(n),			\
+				atmel_assigned_clocks, gclk, gen),		\
 		.gclk_id = DT_INST_CLOCKS_CELL_BY_NAME(n, gclk, id),		\
 		.mclk = ATMEL_SAM0_DT_INST_MCLK_PM_REG_ADDR_OFFSET(n),		\
 		.mclk_mask = ATMEL_SAM0_DT_INST_MCLK_PM_PERIPH_MASK(n, bit),	\
