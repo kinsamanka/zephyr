@@ -8,6 +8,7 @@
 
 #include <microchip/pic32cm1216mcxx.dtsi>
 #include <microchip/pic32cmxxmc00032.dtsi>
+#include <zephyr/dt-bindings/adc/adc.h>
 #include <zephyr/dt-bindings/gpio/gpio.h>
 #include <zephyr/dt-bindings/i2c/i2c.h>
 #include <zephyr/dt-bindings/pinctrl/atmel_sam_pinctrl.h>
@@ -25,6 +26,8 @@
 #define PA23F_TCC0_WO5 SAM_PINMUX(a, 23, f, periph)
 #define PA23E_TC0_WO1 SAM_PINMUX(a, 23, e, periph)
 
+#define PA11B_ADC0_AIN11 SAM_PINMUX(a, 11, b, periph)
+
 / {
 	model = "PIC32CM MC00 Curiosity Nano";
 	compatible = "microchip,curiosity_nano_mc";
@@ -37,6 +40,7 @@
 	};
 
 	aliases {
+		adc-0 = &adc0;
 		led0 = &led0;
 		pwm-led0 = &pwm_led0;
 	};
@@ -69,6 +73,12 @@
 };
 
 &pinctrl {
+	adc0_default: adc0_default {
+		group1 {
+			pinmux = <PA11B_ADC0_AIN11>;
+		};
+	};
+
 	sercom0_i2c: sercom0_i2c {
 		group1 {
 			pinmux = <PA8C_SERCOM0_PAD0>,
@@ -102,6 +112,23 @@
 		group1 {
 			pinmux = <PA23E_TC0_WO1>;
 		};
+	};
+};
+
+&adc0 {
+	status = "okay";
+	prescaler = <4>;
+	pinctrl-0 = <&adc0_default>;
+	pinctrl-names = "default";
+	#address-cells = <1>;
+	#size-cells = <0>;
+	channel@b {
+		reg = <11>;
+		zephyr,gain = "ADC_GAIN_1";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <0>;
+		zephyr,resolution = <12>;
+		zephyr,input-positive = <11>;
 	};
 };
 
