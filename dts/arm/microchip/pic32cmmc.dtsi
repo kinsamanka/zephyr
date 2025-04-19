@@ -229,6 +229,32 @@
 			atmel,assigned-clock-names = "GCLK";
 			status = "disabled";
 		};
+
+		adc0: adc@42004400 {
+			compatible = "atmel,sam0-adc";
+			reg = <0x42004400 0x30>;
+			interrupts = <21 0>;
+			interrupt-names = "resrdy";
+			clocks = <&gclk 28>, <&mclk 28 17>;
+			clock-names = "GCLK", "MCLK";
+			atmel,assigned-clocks = <&gclk 0>;
+			atmel,assigned-clock-names = "GCLK";
+			#io-channel-cells = <1>;
+			status = "disabled";
+		};
+
+		adc1: adc@42004800 {
+			compatible = "atmel,sam0-adc";
+			reg = <0x42004800 0x30>;
+			interrupts = <22 0>;
+			interrupt-names = "resrdy";
+			clocks = <&gclk 29>, <&mclk 28 18>;
+			clock-names = "GCLK", "MCLK";
+			atmel,assigned-clocks = <&gclk 0>;
+			atmel,assigned-clock-names = "GCLK";
+			#io-channel-cells = <1>;
+			status = "disabled";
+		};
 	};
 
 	sram0: memory@20000000 {
